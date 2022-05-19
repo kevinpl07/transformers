@@ -14,6 +14,7 @@
 # limitations under the License.
 """ PyTorch GPT-J model."""
 
+import multiprocessing
 from typing import Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from memorizing_transformers_pytorch import KNNMemory
 from ...activations import ACT2FN
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
@@ -54,6 +56,20 @@ GPTJ_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all GPT-J models at https://huggingface.co/models?filter=gptj
 ]
 
+memory = KNNMemory(
+    dim = 4096,                   # dimension of key / values
+    max_memories = 64000,       # maximum number of memories to keep (will throw out the oldest memories for now if it overfills)
+    num_indices = 1     ,       # this should be equivalent to batch dimension, as each batch keeps track of its own memories, expiring when it sees a new document
+    multiprocessing = False
+)
+
+memory.add(torch.randn(1, 512, 2, 4096))  # (batch, seq, key | value, feature dim)
+memory.add(torch.randn(1, 512, 2, 4096))
+
+memory.clear([0]) # clear batch 0, if it saw an <sos>
+
+memory.add(torch.randn(1, 512, 2, 4096))
+memory.add(torch.randn(1, 512, 2, 4096))
 
 def fixed_pos_embedding(x, seq_dim=1, seq_len=None):
     dim = x.shape[-1]
@@ -174,9 +190,11 @@ class GPTJAttention(nn.Module):
 
         attn_weights = attn_weights / self.scale_attn
 
+
         if attention_mask is not None:
             # Apply the attention mask
             attn_weights = attn_weights + attention_mask
+
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         attn_weights = attn_weights.to(value.dtype)
@@ -263,6 +281,240 @@ class GPTJAttention(nn.Module):
 
         return outputs  # a, present, (attentions)
 
+class GPTJKNNAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        max_positions = config.max_position_embeddings
+        self.register_buffer(
+            "bias",
+            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
+                1, 1, max_positions, max_positions
+            ),
+        )
+        self.register_buffer("masked_bias", torch.tensor(-1e9))
+
+        self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(config.resid_pdrop)
+
+        self.embed_dim = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_attention_heads
+        if self.head_dim * self.num_attention_heads != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and"
+                f" `num_attention_heads`: {self.num_attention_heads})."
+            )
+        self.scale_attn = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32)).to(torch.get_default_dtype())
+
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.rotary_dim = None
+        if config.rotary_dim is not None:
+            self.rotary_dim = config.rotary_dim
+
+    def _split_heads(self, tensor, num_attention_heads, attn_head_size, rotary):
+        """
+        Splits hidden dim into attn_head_size and num_attention_heads
+        """
+        new_shape = tensor.size()[:-1] + (num_attention_heads, attn_head_size)
+        tensor = tensor.view(new_shape)
+        if rotary:
+            return tensor
+        if len(tensor.shape) == 5:
+            return tensor.permute(0, 1, 3, 2, 4)  # (batch, blocks, head, block_length, head_features)
+        elif len(tensor.shape) == 4:
+            return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        else:
+            raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
+
+    def _merge_heads(self, tensor, num_attention_heads, attn_head_size):
+        """
+        Merges attn_head_size dim and num_attn_heads dim into hidden dim
+        """
+        if len(tensor.shape) == 5:
+            tensor = tensor.permute(0, 1, 3, 2, 4).contiguous()
+        elif len(tensor.shape) == 4:
+            tensor = tensor.permute(0, 2, 1, 3).contiguous()
+        else:
+            raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
+        new_shape = tensor.size()[:-2] + (num_attention_heads * attn_head_size,)
+        return tensor.view(new_shape)
+
+    def _attn(
+        self,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        head_mask=None,
+    ):
+        
+        # compute causal mask from causal mask buffer
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].bool()
+
+        # Keep the attention weights computation in fp32 to avoid overflow issues
+        query = query.to(torch.float32)
+        key = key.to(torch.float32)
+
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        
+        attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
+
+        attn_weights = attn_weights / self.scale_attn
+        if attention_mask is not None:
+            # Apply the attention mask
+            
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        attn_output = torch.matmul(attn_weights, value)
+
+        return attn_output, attn_weights
+
+
+    def _attn_memories(
+        self,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        head_mask=None,
+    ):
+        
+        # compute causal mask from causal mask buffer
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = self.bias[:, :,  : query_length, :key_length].bool()
+
+        # Keep the attention weights computation in fp32 to avoid overflow issues
+        query = query.to(torch.float32)
+        key = key.to(torch.float32)
+        attn_weights = torch.einsum('b h i d, b h i j d -> b h i j', query, key)
+
+        attn_weights = torch.where(causal_mask, attn_weights, self.masked_bias.to(attn_weights.dtype))
+        attn_weights = attn_weights / self.scale_attn
+
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = attn_weights.to(value.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        attn_output = torch.einsum('b h i j, b h i j d -> b h i d', attn_weights, value)
+        return attn_output, attn_weights
+
+
+    def forward(
+        self,
+        hidden_states: Optional[torch.FloatTensor],
+        attention_mask: Optional[torch.FloatTensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Tuple[torch.Tensor]],
+        Optional[Tuple[torch.Tensor, Tuple[torch.Tensor], Tuple[torch.Tensor, ...]]],
+    ]:
+
+        query = self.q_proj(hidden_states)
+        key = self.k_proj(hidden_states)
+        value = self.v_proj(hidden_states)
+        
+        new_kv_memories = torch.stack((key, value), dim = -2).detach()
+
+        mem_kv, _ = memory.search(query.type(torch.float32), 32)
+        mem_k, mem_v = mem_kv.unbind(dim = -2)
+
+        mem_k = self._split_heads(mem_k, self.num_attention_heads, self.head_dim, True)
+        mem_k = mem_k.permute([0,3,1,2,4])
+        mem_v = self._split_heads(mem_v, self.num_attention_heads, self.head_dim, False)
+        mem_v = mem_v.permute([0,2,1,3,4])
+
+        memory.add(new_kv_memories.type(torch.float32))
+
+        query = self._split_heads(query, self.num_attention_heads, self.head_dim, True)
+        key = self._split_heads(key, self.num_attention_heads, self.head_dim, True)
+        value = self._split_heads(value, self.num_attention_heads, self.head_dim, False)
+
+        seq_len = key.shape[1]
+        offset = 0
+        
+        print(key.shape)
+        print(mem_k.shape)
+
+        if layer_past is not None:
+            offset = layer_past[0].shape[-2]
+            seq_len += offset
+
+        if self.rotary_dim is not None:
+            k_rot = key[:, :, :, : self.rotary_dim]
+            k_pass = key[:, :, :, self.rotary_dim :]
+
+            q_rot = query[:, :, :, : self.rotary_dim]
+            q_pass = query[:, :, :, self.rotary_dim :]
+
+            sincos = fixed_pos_embedding(k_rot, 1, seq_len=seq_len)
+            k_rot = apply_rotary_pos_emb(k_rot, sincos, offset=offset)
+            q_rot = apply_rotary_pos_emb(q_rot, sincos, offset=offset)
+
+            key = torch.cat([k_rot, k_pass], dim=-1)
+            query = torch.cat([q_rot, q_pass], dim=-1)
+        else:
+            sincos = fixed_pos_embedding(key, 1, seq_len=seq_len)
+            key = apply_rotary_pos_emb(key, sincos, offset=offset)
+            query = apply_rotary_pos_emb(query, sincos, offset=offset)
+
+        key = key.permute(0, 2, 1, 3)
+        query = query.permute(0, 2, 1, 3)   # (batch, head, seq_length, head_features)
+
+        if layer_past is not None:
+            past_key = layer_past[0]
+            past_value = layer_past[1]
+            key = torch.cat((past_key, key), dim=-2)
+            value = torch.cat((past_value, value), dim=-2)
+
+        if use_cache is True:
+            present = (key, value)
+        else:
+            present = None
+
+        # compute self-attention: V x Softmax(QK^T)
+
+        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+
+        attn_output_memory, attn_weights_memory = self._attn_memories(query, mem_k, mem_v, attention_mask, head_mask)
+        print(attn_output.shape)
+        print(attn_output_memory.shape)
+        attn_output = attn_output * 0.5 + attn_output_memory * 0.5
+        # print(attn_weights.shape)
+        # print(attn_weights_memory.shape)
+        # attn_weights = attn_weights * 0.5 + attn_weights_memory * 0.5
+
+        attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_dim).to(torch.float16)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+
+        outputs = (attn_output, present)
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs  # a, present, (attentions)
+
 
 class GPTJMLP(nn.Module):
     def __init__(self, intermediate_size, config):  # in MLP: intermediate_size= 4 * embed_dim
@@ -323,6 +575,45 @@ class GPTJBlock(nn.Module):
 
         return outputs  # hidden_states, present, (attentions)
 
+class GPTJKNNBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        inner_dim = config.n_inner if config.n_inner is not None else 4 * config.n_embd
+        self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+        self.attn = GPTJKNNAttention(config)
+        self.mlp = GPTJMLP(inner_dim, config)
+
+    def forward(
+        self,
+        hidden_states: Optional[torch.FloatTensor],
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
+        residual = hidden_states
+        hidden_states = self.ln_1(hidden_states)
+        attn_outputs = self.attn(
+            hidden_states,
+            layer_past=layer_past,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+        )
+        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
+        outputs = attn_outputs[1:]
+
+        feed_forward_hidden_states = self.mlp(hidden_states)
+        hidden_states = attn_output + feed_forward_hidden_states + residual
+
+        if use_cache:
+            outputs = (hidden_states,) + outputs
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        return outputs  # hidden_states, present, (attentions)
 
 class GPTJPreTrainedModel(PreTrainedModel):
     """
@@ -480,7 +771,8 @@ class GPTJModel(GPTJPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPTJBlock(config) for _ in range(config.n_layer)])
+        module_list = [GPTJBlock(config) for _ in range(config.n_layer-2)] + [GPTJKNNBlock(config), GPTJBlock(config)]
+        self.h = nn.ModuleList(module_list)
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
